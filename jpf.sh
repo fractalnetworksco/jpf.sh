@@ -3,7 +3,7 @@
 # This script sets up, removes, and shows port forwarding rules using nftables.
 
 show_usage() {
-    echo "Usage: $0 [-v] [add|remove|show] [tcp|udp] <listen_port> <target_ip> <target_port> [allowed_source]"
+    echo "Usage: $0 [-v] [add|remove|show] [tcp|udp] <listen_port> <target_ip> <target_port> [allowed_source] [local_interface_ip]"
     echo "Example: $0 add tcp 8000 192.168.0.1 80"
     echo "         $0 add udp 5353 10.0.0.53 53 203.0.113.0/24"
     echo "         $0 remove tcp 8000 192.168.0.1 80"
@@ -47,7 +47,7 @@ add_forward() {
     target_ip=$3
     target_port=$4
     allowed_source=$5
-    container_ip=$(ip -4 addr show | grep inet | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1)
+    container_ip=$6
 
     src_rule=""
     src_msg=""
@@ -58,13 +58,13 @@ add_forward() {
 
     log "Adding NAT prerouting rule..."
     nft add rule ip nat prerouting $src_rule $proto dport $listen_port dnat to $target_ip:$target_port || { echo "Failed to add prerouting rule"; return 1; }
-    
+
     log "Adding NAT output rule..."
     nft add rule ip nat output $proto dport $listen_port ip daddr $container_ip dnat to $target_ip:$target_port || { echo "Failed to add output rule"; return 1; }
-    
+
     log "Adding filter forward rule..."
     nft add rule ip filter forward $src_rule $proto dport $target_port ip daddr $target_ip ct state new accept || { echo "Failed to add forward rule"; return 1; }
-    
+
     log "Adding NAT postrouting rule..."
     nft add rule ip nat postrouting ip daddr $target_ip $proto dport $target_port masquerade || { echo "Failed to add postrouting rule"; return 1; }
 
@@ -78,7 +78,7 @@ remove_forward() {
     target_ip=$3
     target_port=$4
     allowed_source=$5
-    container_ip=$(ip -4 addr show | grep inet | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1)
+    container_ip=$6
 
     src_rule=""
     src_msg=""
@@ -94,7 +94,7 @@ remove_forward() {
     else
         echo "Error: No matching prerouting rule found."
     fi
-    
+
     log "Removing NAT output rule..."
     rule_handle=$(nft -a list chain ip nat output | grep "$proto dport $listen_port ip daddr $container_ip.*dnat to $target_ip:$target_port" | awk '{print $NF}')
     if [ -n "$rule_handle" ]; then
@@ -125,16 +125,16 @@ remove_forward() {
 show_forwards() {
     echo "Current Port Forwards:"
     echo "----------------------"
-    
+
     echo "NAT Prerouting Rules:"
     nft list chain ip nat prerouting | grep dnat | sed 's/^[ \t]*/  /'
-    
+
     echo "NAT Output Rules:"
     nft list chain ip nat output | grep dnat | sed 's/^[ \t]*/  /'
-    
+
     echo "Forward Rules:"
     nft list chain ip filter forward | grep "dport .* ip daddr .* ct state new accept" | sed 's/^[ \t]*/  /'
-    
+
     echo "NAT Postrouting Rules:"
     nft list chain ip nat postrouting | grep masquerade | sed 's/^[ \t]*/  /'
 }
@@ -151,6 +151,18 @@ log() {
     [ "$VERBOSE" = true ] && echo "$@"
 }
 
+enable_ip_forwarding() {
+    if [ "$(cat /proc/sys/net/ipv4/ip_forward)" -ne 1 ]; then
+        if ! echo 1 > /proc/sys/net/ipv4/ip_forward; then
+            echo "Error: Failed to enable IP forwarding."
+            exit 1
+        fi
+        echo "IP forwarding enabled."
+    else
+        echo "IP forwarding is already enabled."
+    fi
+}
+
 main() {
     VERBOSE=false
     [ "$1" = "-v" ] && VERBOSE=true && shift
@@ -160,7 +172,7 @@ main() {
         exit 0
     }
 
-    [ $# -lt 5 -o $# -gt 6 ] && {
+    [ $# -lt 5 -o $# -gt 7 ] && {
         show_usage
         exit 1
     }
@@ -174,16 +186,21 @@ main() {
     target_ip=$4
     target_port=$5
     allowed_source=$6
+    default_ip=$(ip -4 addr show | grep inet | grep -v '127.0.0.1' | awk '{print $2}' | cut -d/ -f1 | head -n 1)
+    container_ip=${7:-$default_ip}
+
 
     validate_port_number "$listen_port"
     validate_port_number "$target_port"
 
+    enable_ip_forwarding
+
     case $action in
         add)
-            add_forward "$proto" "$listen_port" "$target_ip" "$target_port" "$allowed_source"
+            add_forward "$proto" "$listen_port" "$target_ip" "$target_port" "$allowed_source" "$container_ip"
             ;;
         remove)
-            remove_forward "$proto" "$listen_port" "$target_ip" "$target_port" "$allowed_source"
+            remove_forward "$proto" "$listen_port" "$target_ip" "$target_port" "$allowed_source" "$container_ip"
             ;;
         *)
             echo "Invalid action. Use 'add', 'remove', or 'show'."
@@ -192,12 +209,6 @@ main() {
             ;;
     esac
 }
-
-# Enable IP forwarding and check for success
-if ! echo 1 > /proc/sys/net/ipv4/ip_forward; then
-    echo "Error: Failed to enable IP forwarding."
-    exit 1
-fi
 
 # Run the main function
 main "$@"
